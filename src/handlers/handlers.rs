@@ -15,11 +15,11 @@ type WebResult<T> = Result<T, Error>;
 pub(crate) enum Error {
     #[error("Unknown webauthn error")]
     Unknown(WebauthnError),
-    #[error("Corrupt session")]
+    #[error("Corrupt get session error")]
     SessionGet(#[from] SessionGetError),
-    #[error("Corrupt session")]
+    #[error("Corrupt insert session error")]
     SessionInsert(#[from] SessionInsertError),
-    #[error("Corrupt session")]
+    #[error("Corrupt session error")]
     CorruptSession,
     #[error("Bad request")]
     BadRequest(#[from] WebauthnError),
@@ -97,9 +97,13 @@ pub(crate) async fn register_finish(
     webauthn: Data<Webauthn>,
     webauthn_users: Data<Mutex<UserData>>,
 ) -> WebResult<HttpResponse> {
+
     let (username, user_unique_id, reg_state): (String,String, PasskeyRegistration)  = match session.get("reg_state")? {
         Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),
-        None => return Err(Error::CorruptSession),
+        None => return {
+            debug!("Session state 'reg_state' not found.");
+            Err(Error::CorruptSession)
+        },
     };
 
     session.remove("reg_state");
