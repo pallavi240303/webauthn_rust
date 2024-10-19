@@ -1,4 +1,6 @@
 
+use std::collections::HashMap;
+
 use actix_session::{Session, SessionGetError, SessionInsertError};
 use actix_web::{web::{Data, Json, Path}, HttpResponse };
 use base64urlsafedata::HumanBinaryData;
@@ -97,6 +99,17 @@ pub(crate) async fn register_finish(
     webauthn: Data<Webauthn>,
     webauthn_users: Data<Mutex<UserData>>,
 ) -> WebResult<HttpResponse> {
+    let cookies: Vec<_> = session
+        .get::<HashMap<String, String>>("reg_state") // Change this based on your session data structure
+        .unwrap_or_else(|_| {
+            error!("Failed to retrieve session data");
+            None
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    
+    println!("Received cookies: {:?}", cookies);
 
     let (username, user_unique_id, reg_state): (String,String, PasskeyRegistration)  = match session.get("reg_state")? {
         Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),

@@ -1,6 +1,6 @@
 use actix_cors::Cors;
 use actix_session::SessionMiddleware;
-use actix_web::{cookie::Key, http, middleware::{self, Logger}, web, App, HttpServer};
+use actix_web::{cookie::{Key, SameSite}, http, middleware::{self, Logger}, web, App, HttpServer};
 use handlers::handlers::{finish_authentication, register_finish, register_start, start_authentication};
 use log::info;
 use session::MemorySession;
@@ -22,7 +22,7 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::default()
             .allowed_origin("http://localhost:3000") 
             .allowed_methods(vec!["GET", "POST", "OPTIONS"]) 
-            .allowed_headers(vec!["Content-Type"]) 
+            .allowed_headers(vec![http::header::AUTHORIZATION, http::header::ACCEPT, http::header::CONTENT_TYPE])
             .allow_any_header() 
             .supports_credentials();
 
@@ -31,8 +31,10 @@ async fn main() -> std::io::Result<()> {
         .wrap(middleware::Logger::default())
         .wrap(
             SessionMiddleware::builder(MemorySession, key.clone())
+            
                 .cookie_name("webauthnrs".to_string())
                 .cookie_http_only(true)
+                .cookie_same_site(SameSite::None)
                 .cookie_secure(false)
                 .build(),
         )
