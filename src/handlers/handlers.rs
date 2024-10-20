@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 use webauthn_rs::prelude::*;
 use actix_web::http::StatusCode;
 use webauthn_rs::prelude::WebauthnError;
-use crate::startup::UserData;
+use crate::{db_operations_repo::user_passkey_repo::UserRepo, startup::UserData};
 use thiserror::Error;
 type WebResult<T> = Result<T, Error>;
 
@@ -30,6 +30,8 @@ pub(crate) enum Error {
     DatabaseQueryError,
     #[error("Deserialization error ")]
     DeserialisationError,
+    #[error("Serialization error ")]
+    SerialisationError,
     #[error("Username is not available")]
     UsernameUnavailable
 }
@@ -48,50 +50,35 @@ pub(crate) async fn register_start(
     webauthn: Data<Webauthn>,
 ) -> WebResult<Json<CreationChallengeResponse>> {
     info!("Start Register");
-    let user_unique_id = {
-        let users_guard = webauthn_users.lock().await;
 
-        let user_exists = users_guard
-            .client
-            .query_one("SELECT unique_id FROM users WHERE username = $1", &[&username.to_string()])
-            .await
-            .is_ok();
+    let repo = UserRepo { client : &webauthn_users.lock().await.client};
 
-        if user_exists {
-            return Err(Error::UsernameUnavailable);
-        }
-
-        let unique_id_str = users_guard
-            .client
-            .query_one("SELECT unique_id FROM users WHERE username = $1", &[&username.to_string()])
-            .await
-            .map(|row| row.get(0))
-            .unwrap_or_else(|_| Uuid::new_v4());
-        unique_id_str
-    };
-
+    // Check if user exists
+    let user_exists = repo.find_unique_id_by_username(&username).await.unwrap().is_some();
+    if user_exists {
+        return Err(Error::UsernameUnavailable);
+    }
+        
+    // Generate new unique ID
+    let user_unique_id = Uuid::new_v4();
     session.remove("reg_state");
 
+    // Start the WebAuthn registration
     let (ccr , reg_state) = webauthn.start_passkey_registration(user_unique_id, &username, &username,None)
     .map_err(|e| {
         debug!("Challenge_register -> {:?}",e);
         Error::Unknown(e)
     })?;
 
+    // Store the registration state in the session
     if let Err(err) = session.insert("reg_state", (username.as_str(), user_unique_id, reg_state)) {
         error!("Failed to save reg_state to session storage!");
         return Err(Error::SessionInsert(err));
     };
 
-
     info!("Registeration initiation successful");
     Ok(Json(ccr))
 }
-
-
-
-
-
 
 
 
@@ -101,18 +88,12 @@ pub(crate) async fn register_finish(
     webauthn: Data<Webauthn>,
     webauthn_users: Data<Mutex<UserData>>,
 ) -> WebResult<HttpResponse> {
-    let (username, user_unique_id, reg_state): (String, Uuid, PasskeyRegistration) = match session.get("reg_state")? {
-        Some((username, user_unique_id, reg_state)) => (username, user_unique_id, reg_state),
-        None => return Err(Error::CorruptSession),
-    };
+    let (username, user_unique_id, reg_state): (String, Uuid, PasskeyRegistration) =
+        session.get("reg_state")?.ok_or(Error::CorruptSession)?;
 
-    let session_data: Option<(String, Uuid, PasskeyRegistration)> = session.get("reg_state")?;
-    println!("Session data: {:?}", session_data);
-    if session_data.is_none() {
-        println!("No session data found for 'reg_state'");
-    }
+    let repo = UserRepo { client: &webauthn_users.lock().await.client };
 
-    println!("Attempting to finish registration with req: {:?}, reg_state: {:?}", req, reg_state);
+    // Finish WebAuthn registration
     let sk = webauthn
         .finish_passkey_registration(&req, &reg_state)
         .map_err(|e| {
@@ -121,49 +102,17 @@ pub(crate) async fn register_finish(
         })?;
 
     let sk_json = serde_json::to_value(&sk).unwrap();
-    let users_guard = webauthn_users.lock().await;
 
-    let user_exists_result = users_guard.client.query_opt(
-        "SELECT id FROM users WHERE username = $1",
-        &[&username],
-    ).await;
-
-    let user_exists = match user_exists_result {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(e) => {
-            println!("Error querying user: {:?}", e);
-            return Err(Error::DatabaseQueryError);
-        }
-    };
-
-    // If the user does not exist, insert the username into the users table
-    if !user_exists {
+    // Check if the user exists, insert the user and passkey if not
+    if repo.find_unique_id_by_username(&username).await.unwrap().is_none() {
         let unique_id = Uuid::new_v4();
-        println!("unique id : {:?}", unique_id);
-        println!("username : {:?}", username);
-        println!("passkey data : {:?}", sk_json);
-
-        let _ = users_guard.client.execute(
-            "INSERT INTO users (unique_id, username) VALUES ($1, $2)",
-            &[&unique_id, &username],
-        ).await.map_err(|e| {
-            println!("Database insert error: {:?}", e);
-        });
-
-        let _ = users_guard.client.execute(
-            "INSERT INTO passkeys_data (user_id, passkey_data) VALUES ($1, $2)",
-            &[&unique_id, &sk_json],
-        ).await;
+        repo.insert_user(&unique_id, &username).await.unwrap();
+        repo.insert_passkey(&unique_id, &sk_json).await.unwrap();
     } else {
-        let _ = users_guard.client.execute(
-            "INSERT INTO passkeys_data (user_id, passkey_data) VALUES ($1, $2)",
-            &[&user_unique_id, &sk_json],
-        ).await;
+        repo.insert_passkey(&user_unique_id, &sk_json).await.unwrap();
     }
 
     session.remove("reg_state");
-    println!("response sent: {:?}", HttpResponse::Ok().finish());
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -180,46 +129,31 @@ pub(crate) async fn start_authentication(
     info!("Start Authentication");
     session.remove("auth_state");
 
-    let user_unique_id = {
-        let users_guard = webauthn_users.lock().await;
+    let repo = UserRepo { client: &webauthn_users.lock().await.client };
 
-        let user_id_row = users_guard.client.query_opt(
-            "SELECT unique_id FROM users WHERE username = $1",
-            &[&username.to_string()],
-        ).await.map_err(|e| {
+    let user_unique_id = {
+        let user_id = repo.find_unique_id_by_username(&username).await.map_err(|e| {
             println!("Database query error: fetching the user details  {:?}", e);
             Error::DatabaseQueryError
         })?;
-
-        match user_id_row {
-            Some(row) => row.get::<_,Uuid>(0),
-            None => return Err(Error::UserNotFound),
+        match user_id {
+            Some(id) => id,
+            None =>  return Err(Error::UserNotFound)
         }
     };
 
-    let allow_credentials = {
-        let users_guard = webauthn_users.lock().await;
 
-        let rows = users_guard.client.query(
-            "SELECT passkey_data FROM passkeys_data WHERE user_id = $1",
-            &[&user_unique_id],
-        ).await.map_err(|e| {
+    let allow_credentials = {
+        let rows = repo.find_passkeys_by_user_id(&user_unique_id).await.map_err(|e| {
             println!("Database query error: fetching the passkey data  {:?}", e);
             Error::DatabaseQueryError
         })?;
 
-        if let Some(row) = rows.get(0) {
-            let pk_json: serde_json::Value = row.get(0);
-            match serde_json::from_value(pk_json) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    println!("Passkey couldn't be deserialized - {:?}", e);
-                    return Err(Error::DeserialisationError);
-                }
-            }
-        } else {
-            return Err(Error::UserHasNoCredentials);
-        }
+        let pk_json = rows.ok_or(Error::UserHasNoCredentials)?;
+        serde_json::from_value(pk_json).map_err(|e| {
+            println!("Passkey couldn't be deserialized - {:?}", e);
+            Error::DeserialisationError
+        })?
     };
 
     let (rcr, auth_state) = webauthn
@@ -230,8 +164,6 @@ pub(crate) async fn start_authentication(
         })?;
 
     session.insert("auth_state", (user_unique_id, &auth_state))?;
-    println!("Session auth state: {:?}", auth_state.clone());
-        println!("started authentication");
     Ok(Json(rcr))
 }
 
@@ -246,10 +178,7 @@ pub(crate) async fn finish_authentication(
 ) -> WebResult<HttpResponse> {
     println!("startedt finish authentication");
     let (user_unique_id , auth_state) : (Uuid, PasskeyAuthentication)= session.get("auth_state")?.ok_or(Error::CorruptSession)?;
-    println!("Received auth data: {:?}", auth);
-
     
-
     let auth_result = webauthn
         .finish_passkey_authentication(&auth, &auth_state)
         .map_err(|e| {
@@ -258,42 +187,21 @@ pub(crate) async fn finish_authentication(
         })?;
         println!("auth result  : {:?}",auth_result);
 
-    let  users_guard = webauthn_users.lock().await;
-    let rows = users_guard.client.query(
-        "SELECT passkey_data FROM passkeys_data WHERE user_id = $1",
-        &[&user_unique_id],
-    ).await.map_err(|e| {
-        println!("Database query error: {:?}", e);
-        Error::DatabaseQueryError
-    })?;
+    let repo = UserRepo { client: &webauthn_users.lock().await.client };
 
-    if rows.is_empty() {
-        return Err(Error::UserHasNoCredentials); 
-    }
+    let stored_passkey_json = repo.find_passkeys_by_user_id(&user_unique_id)
+        .await.unwrap()
+        .ok_or(Error::UserHasNoCredentials)?;
 
-    for row in rows {
-        let pk_json: serde_json::Value = row.get(0);
+    let mut stored_passkey: Passkey = serde_json::from_value(stored_passkey_json.clone())
+    .map_err(|e| {Error::DeserialisationError})?;
 
-        let mut stored_passkey: Passkey = serde_json::from_value(pk_json.clone()).map_err(|e| {
-            println!("Failed to deserialize passkey: {:?}", e);
-            Error::DeserialisationError
-        })?;
+    stored_passkey.update_credential(&auth_result);
 
-        stored_passkey.update_credential(&auth_result);
+    let updated_passkey_json = serde_json::to_value(&stored_passkey)
+        .map_err(|e| {Error::SerialisationError})?;
 
-        let updated_passkey_json = serde_json::to_value(&stored_passkey).map_err(|e| {
-            println!("Failed to serialize updated passkey: {:?}", e);
-            Error::DeserialisationError
-        })?;
-
-        users_guard.client.execute(
-            "UPDATE passkeys_data SET passkey_data = $1 WHERE user_id = $2 AND passkey_data = $3",
-            &[&updated_passkey_json, &user_unique_id, &pk_json],
-        ).await.map_err(|e| {
-            println!("Database update error: {:?}", e);
-            Error::DatabaseQueryError
-        })?;
-    }
+    repo.update_passkey(&user_unique_id, &stored_passkey_json , &updated_passkey_json).await.unwrap();
     session.remove("auth_state");
     println!("Authentication Successful for user:");
     Ok(HttpResponse::Ok().finish())
