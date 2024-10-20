@@ -14,7 +14,7 @@ pub(crate) struct UserData {
 
 pub(crate) async fn startup() -> (Data<Webauthn>, Data<Mutex<UserData>>){
     let rp_id = "localhost";
-    let rp_origin = Url::parse("http://localhost:8080").expect("Invalid URL");
+    let rp_origin = Url::parse("http://localhost:3000").expect("Invalid URL");
     let builder = WebauthnBuilder::new(rp_id, &rp_origin).expect("Invalid configuration");
     let builder = builder.rp_name("Actix-web webauthn-rs");
     let webauthn = Data::new(builder.build().expect("Invalid configuration"));

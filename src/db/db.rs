@@ -12,7 +12,7 @@ pub async fn connect_db() -> Result<Client, Error> {
     let (client, connection) = tokio_postgres::connect(&database_url, connector).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("Connection error: {}", e);
+            println!("Connection error: {}", e);
         }
     });
 

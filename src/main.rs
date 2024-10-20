@@ -34,7 +34,7 @@ async fn main() -> std::io::Result<()> {
             
                 .cookie_name("webauthnrs".to_string())
                 .cookie_http_only(true)
-                .cookie_same_site(SameSite::None)
+                .cookie_same_site(SameSite::Lax)
                 .cookie_secure(false)
                 .build(),
         )
@@ -43,7 +43,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(webauthn_users.clone()) 
             .route("/register/start/{username}", web::post().to(register_start))
             .route("/register/finish", web::post().to(register_finish))
-            .route("/login/{username}", web::post().to(start_authentication))
+            .route("/login/start/{username}", web::post().to(start_authentication))
             .route("/login/finish",web::post().to(finish_authentication))
         
     })
