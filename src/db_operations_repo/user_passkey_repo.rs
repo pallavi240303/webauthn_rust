@@ -19,6 +19,7 @@ impl<'a> UserRepo<'a> {
         &self,
         username: &str
     ) -> Result<Option<Uuid>, RepoError> {
+        println!("entered the find unique id from username function");
         self.client
             .query_opt("SELECT unique_id FROM users WHERE username = $1", &[&username])
             .await

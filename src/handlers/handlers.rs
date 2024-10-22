@@ -202,7 +202,10 @@ pub(crate) async fn finish_authentication(
         .map_err(|e| {Error::SerialisationError})?;
 
     repo.update_passkey(&user_unique_id, &stored_passkey_json , &updated_passkey_json).await.unwrap();
-    session.remove("auth_state");
-    println!("Authentication Successful for user:");
+    session
+        .insert("user_unique_id", user_unique_id)
+        .map_err(|_| Error::CorruptSession)?;
+
+    println!("Authentication Successful for user: {:?}", user_unique_id);
     Ok(HttpResponse::Ok().finish())
 }
