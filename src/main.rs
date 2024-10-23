@@ -1,23 +1,25 @@
+use actix::Actor;
 use actix_cors::Cors;
-use actix_session::{Session, SessionMiddleware};
-use actix_web::{dev::Service,cookie::{Key, SameSite}, http, middleware::{self, Logger}, web, App, Error, HttpResponse, HttpServer};
-use db_operations_repo::poll_repo::{self, PollRepo};
-use handlers::{handlers::{finish_authentication, register_finish, register_start, start_authentication}, polls_handlers::create_poll};
+use actix_session::SessionMiddleware;
+use actix_web::{cookie::{Key, SameSite}, http, middleware, web, App, HttpServer};
+use handlers::{handlers::{finish_authentication, register_finish, register_start, start_authentication}, polls_handlers::{create_poll, get_all_polls_from_db, get_poll_details, vote_on_poll}};
 use log::info;
 use session::MemorySession;
 use startup::startup;
+use web_socket_handlers::{lobby::Lobby, start_connection::start_connection as start_connection_route};
 mod db;
 mod db_operations_repo;
 mod startup;
 mod handlers;
 mod session;
-
+mod web_socket_handlers;
 
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let (webauthn, webauthn_users) = startup().await;
 
+    let socket_server = Lobby::default().start();
     
     info!("Listening on: http://127.0.0.1:5500");
     let key = Key::generate();
@@ -42,7 +44,9 @@ async fn main() -> std::io::Result<()> {
                 .cookie_secure(false)
                 .build(),
         )
+        
         .wrap(cors)
+        .app_data(socket_server.clone())
             .app_data(webauthn.clone())
             .app_data(webauthn_users.clone()) 
             .route("/register/start/{username}", web::post().to(register_start))
@@ -50,6 +54,10 @@ async fn main() -> std::io::Result<()> {
             .route("/login/start/{username}", web::post().to(start_authentication))
             .route("/login/finish",web::post().to(finish_authentication))
             .route("/poll/new", web::post().to(create_poll))
+            .route("/ws", web::get().to(start_connection_route))
+            .route("/polls",web::post().to(get_all_polls_from_db))
+            .route("/polls/{poll_id}/vote",web::post().to(vote_on_poll))
+            .route("/polls/{poll_id}",web::get().to(get_poll_details))
         
     })
     .bind("127.0.0.1:5500")?

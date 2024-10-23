@@ -20,11 +20,16 @@ impl<'a> UserRepo<'a> {
         username: &str
     ) -> Result<Option<Uuid>, RepoError> {
         println!("entered the find unique id from username function");
-        self.client
-            .query_opt("SELECT unique_id FROM users WHERE username = $1", &[&username])
+        let query = "SELECT unique_id FROM users WHERE username = $1";
+        println!("query : {:?}",query);
+        let result = self.client
+            .query_opt(query, &[&username])
             .await
             .map(|row| row.map(|r| r.get(0)))
-            .map_err(|_| RepoError::DatabaseQueryError)
+            .map_err(|_| RepoError::DatabaseQueryError);
+
+        println!("hey there");
+        result
     }
 
     // Insert a new user
