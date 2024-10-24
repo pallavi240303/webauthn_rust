@@ -1,12 +1,12 @@
 
 use std::time::Duration;
 
-use crate::{db_operations_repo::{poll_repo::{PollDetails, PollOptions, PollRepo, RepoError}, user_passkey_repo::UserRepo},startup::UserData};
+use crate::{db_operations_repo::{poll_repo::{PollDetails, PollOptions, PollRepo, RepoError}, user_passkey_repo::UserRepo},startup::UserData, web_socket_handlers::start_connection::Chat};
 use actix_web::{web::{self, Data}, Error, HttpResponse};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{sync::{broadcast::{self, Sender}, Mutex}, time::timeout};
 use uuid::Uuid;
 
 #[derive(Serialize,Deserialize)]
@@ -24,12 +24,18 @@ pub struct Poll {
     options: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize,Debug)]
 pub struct VoteRequest {
     username: String,
     option_text: String,
 }
 
+#[derive(Serialize, Deserialize , Clone , Debug)]
+pub struct VoteUpdate {
+    poll_id: i32,
+    option_id: i32,
+    votes: i32,
+}
 
 pub async fn create_poll(
     webauthn_users: Data<Mutex<UserData>>,
@@ -81,9 +87,10 @@ pub async fn vote_on_poll(
     webauthn_users: Data<Mutex<UserData>>,
     poll_id: web::Path<i32>,
     req: web::Json<VoteRequest>,
+    chat: web::Data<Chat>,
 ) -> Result<HttpResponse,Error> {
 
-    println!("Entered vote on pol function");
+
     let user_repo = UserRepo{client: &webauthn_users.lock().await.client};
     let user_id_result = user_repo.find_unique_id_by_username(&req.username).await;
     let user_id = match user_id_result {
@@ -99,6 +106,7 @@ pub async fn vote_on_poll(
     };
 
     let repo = PollRepo {client : &user_repo.client};
+
     let option_id_result = repo.get_option_id_by_text_and_poll_id(req.option_text.clone(), *poll_id).await;
     let option_id = match option_id_result {
         Ok(Some(id)) => id,
@@ -116,11 +124,17 @@ pub async fn vote_on_poll(
         println!("Error incrementing vote_count");
         return Err(actix_web::error::ErrorInternalServerError("Error updating/incrementing vote count"));
     }
+
     let voted_at = Utc::now().to_string();
     if let Err(_) = repo.insert_vote_details(user_id, *poll_id, option_id,voted_at ).await {
         return Err(actix_web::error::ErrorInternalServerError("Error inserting vote record"));
     }
 
+    let updated_vote_count = repo.get_vote_count(option_id).await.unwrap_or(0);
+    let updated_message = format!("{{\"poll_id\": {}, \"option_text\": \"{}\", \"vote_count\": {}}}",poll_id, &req.option_text, updated_vote_count);
+    println!("updated_message : {:?}",updated_message);
+    chat.send(updated_message).await;
+    println!("msg sent ig");
     Ok(HttpResponse::Ok().json("Vote recorded successfully"))
 }
 

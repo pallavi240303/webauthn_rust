@@ -191,5 +191,14 @@ impl<'a> PollRepo<'a> {
             println!("options:  {:?}",options);
         Ok(options)
     }
+
+    pub async fn get_vote_count(&self, option_id: i32) -> Result<i32, tokio_postgres::Error> {
+        println!("entered the get vote count function");
+        let query = "SELECT votes FROM poll_options WHERE id = $1";
+        let row = self.client.query_one(query, &[&option_id]).await?;
+        let vote_count: i32 = row.get("votes");
+        println!("exiting the get vote count function");
+        Ok(vote_count)
+    }
 }
 
