@@ -1,14 +1,10 @@
-use std::sync::Arc;
-
-use actix::Actor;
 use actix_cors::Cors;
 use actix_session::SessionMiddleware;
 use actix_web::{cookie::{Key, SameSite}, http, middleware, web, App, HttpServer};
-use handlers::{handlers::{finish_authentication, register_finish, register_start, start_authentication}, polls_handlers::{create_poll, get_all_polls_from_db, get_poll_details, vote_on_poll, VoteUpdate}};
+use handlers::{handlers::{finish_authentication, register_finish, register_start, start_authentication}, polls_handlers::{close_poll, create_poll, get_all_polls_from_db, get_poll_details, manage_user_polls, reset_poll_votes, vote_on_poll}};
 use log::info;
 use session::MemorySession;
 use startup::startup;
-use tokio::sync::broadcast;
 use web_socket_handlers::{start_connection::Chat, start_connection::ws};
 
 mod db;
@@ -58,11 +54,13 @@ async fn main() -> std::io::Result<()> {
             .route("/login/start/{username}", web::post().to(start_authentication))
             .route("/login/finish",web::post().to(finish_authentication))
             .route("/poll/new", web::post().to(create_poll))
-            // .route("/ws", web::get().to(start_connection_route))
             .route("/polls",web::post().to(get_all_polls_from_db))
             .route("/polls/{poll_id}/vote",web::post().to(vote_on_poll))
             .route("/polls/{poll_id}",web::get().to(get_poll_details))
             .route("/ws", web::get().to(ws))
+            .route("/polls/manage", web::post().to(manage_user_polls))
+            .route("/polls/{poll_id}/close" , web::post().to(close_poll))
+            .route("/polls/{poll_id}/reset" , web::post().to(reset_poll_votes))
         
     })
     .bind("127.0.0.1:5500")?

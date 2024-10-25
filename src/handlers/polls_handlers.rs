@@ -2,8 +2,8 @@
 use std::time::Duration;
 
 use crate::{db_operations_repo::{poll_repo::{PollDetails, PollOptions, PollRepo, RepoError}, user_passkey_repo::UserRepo},startup::UserData, web_socket_handlers::start_connection::Chat};
+use actix_session::Session;
 use actix_web::{web::{self, Data}, Error, HttpResponse};
-
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::{broadcast::{self, Sender}, Mutex}, time::timeout};
@@ -16,12 +16,21 @@ pub struct CreatePollRequest {
     options: Vec<String>,
 }
 
+
+#[derive(Deserialize)]
+pub struct PollQueryParams {
+    creator: Option<Uuid>, // Creator ID, optional
+    live: Option<bool>,    // Whether the poll is live, optional
+    closed: Option<bool>,  // Whether the poll is closed, optional
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Poll {
     id: i32,               
     title: String,
     creator_id: Uuid,    
     options: Vec<String>,
+    
 }
 
 #[derive(Deserialize,Debug)]
@@ -68,18 +77,36 @@ pub async fn create_poll(
     }
 }
 
-pub async fn get_all_polls_from_db(webauthn_users: Data<Mutex<UserData>>) -> Result<HttpResponse,Error> {
+pub async fn get_all_polls_from_db(webauthn_users: Data<Mutex<UserData>> , query: web::Query<PollQueryParams>) -> Result<HttpResponse,Error> {
     let repo = PollRepo {client : &webauthn_users.lock().await.client };
-    match repo.get_all_polls().await {
-        Ok(polls) => {
-            // Serialize the polls into JSON format
-            let response = serde_json::json!(polls); // Using Json to automatically serialize
+    let PollQueryParams { creator, live, closed } = query.into_inner();
+    match repo.get_polls_filtered(creator, live, closed).await {
+        Ok(polls) =>{ 
+            let response = serde_json::json!(polls);
             Ok(HttpResponse::Ok().json(response))
         },
-        Err(e) => {
-            // Handle error case
-            Err(actix_web::error::ErrorInternalServerError(format!("Error fetching polls: {:?}", e)))
-        }
+        Err(e) => Err(actix_web::error::ErrorInternalServerError(format!("Error fetching polls: {:?}", e))),
+    }
+}
+
+pub async fn manage_user_polls(webauthn_users: Data<Mutex<UserData>>,session:Session) -> Result<HttpResponse, Error>{
+    let repo = PollRepo { client: &webauthn_users.lock().await.client };
+    let user_id: Uuid = match session.get("user_unique_id").expect("Session get error") {
+        Some(id) => id, 
+        None => {
+            return Err(actix_web::error::ErrorUnauthorized("User not authenticated"));
+        } 
+    };
+    println!("user id from session:  {:?}",user_id);
+    match repo.get_polls_by_creator(user_id).await {
+        Ok(polls) => {
+            let response_data = serde_json::json!({
+                "user_id": user_id,
+                "polls": polls
+            });
+            Ok(HttpResponse::Ok().json(response_data))
+        },
+        Err(e) => Err(actix_web::error::ErrorInternalServerError(format!("Error fetching user polls: {:?}", e))),
     }
 }
 
@@ -169,4 +196,63 @@ pub async fn get_poll_details(
     };
 
     Ok(HttpResponse::Ok().json(response))
+}
+
+pub async fn close_poll(
+    webauthn_users: Data<Mutex<UserData>>,
+    session:Session,
+    poll_id: web::Path<i32>,
+    chat: web::Data<Chat>
+) -> Result<HttpResponse ,Error> {
+    let user_id: Uuid = match session.get("user_unique_id").expect("Session get error") {
+        Some(id) => id, 
+        None => {
+            return Err(actix_web::error::ErrorUnauthorized("User not authenticated"));
+        } 
+    };
+
+
+    let repo = PollRepo { client: &webauthn_users.lock().await.client };
+
+    match repo.is_poll_creator(user_id, *poll_id).await {
+        Ok(true) => {}, // User is the creator, proceed
+        Ok(false) => return Ok(HttpResponse::Forbidden().body("You are not the creator of this poll")),
+        Err(_) => return Ok(HttpResponse::InternalServerError().body("Error verifying poll creator")),
+    }
+
+    if repo.close_poll(*poll_id).await.is_err(){
+        return Ok(HttpResponse::InternalServerError().body("Error closing the poll"));
+    }
+
+    let close_message = format!("{{\"poll_id\": {}, \"closed\": {}}}",poll_id, true);
+    println!("updated_message : {:?}",close_message);
+
+    chat.send(close_message).await;
+
+    Ok(HttpResponse::Ok().body("Poll closed successfully"))
+}
+
+pub async fn reset_poll_votes(
+    poll_id: web::Path<i32>,
+    session:Session,
+    webauthn_users: web::Data<Mutex<UserData>>,
+) -> Result<HttpResponse, Error> {
+    let repo = PollRepo { client: &webauthn_users.lock().await.client };
+    let user_id: Uuid = match session.get("user_unique_id").expect("Session get error") {
+        Some(id) => id, 
+        None => {
+            return Err(actix_web::error::ErrorUnauthorized("User not authenticated"));
+        } 
+    };
+    match repo.is_poll_creator(user_id, *poll_id).await {
+        Ok(true) => {
+            // Reset votes
+            match repo.reset_votes(*poll_id).await {
+                Ok(_) => Ok(HttpResponse::Ok().json("Poll votes reset successfully")),
+                Err(e) => Err(actix_web::error::ErrorInternalServerError(format!("Error resetting poll votes: {:?}", e))),
+            }
+        },
+        Ok(false) => Err(actix_web::error::ErrorUnauthorized("You are not the creator of this poll")),
+        Err(e) => Err(actix_web::error::ErrorInternalServerError(format!("Error: {:?}", e))),
+    }
 }

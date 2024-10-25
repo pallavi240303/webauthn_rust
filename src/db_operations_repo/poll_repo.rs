@@ -1,6 +1,7 @@
 
 use std::collections::HashMap;
 
+use actix_session::Session;
 use actix_web::{HttpResponse, ResponseError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +20,8 @@ pub enum RepoError {
     DuplicateOptions,
     #[error("A database error occurred")]
     DatabaseError(#[from] tokio_postgres::Error),
+    #[error("Unauthorized User")]
+    UnauthorizedUser
 }
 
 impl ResponseError for RepoError {
@@ -27,7 +30,8 @@ impl ResponseError for RepoError {
             RepoError::NotEnoughOptions => HttpResponse::BadRequest().body(self.to_string()),
             RepoError::DuplicateOptions => HttpResponse::BadRequest().body(self.to_string()),
             RepoError::DatabaseError(_) => HttpResponse::InternalServerError().body("Database error"),
-            RepoError::DatabaseQueryError => HttpResponse::InternalServerError().body("Database Query Error")
+            RepoError::DatabaseQueryError => HttpResponse::InternalServerError().body("Database Query Error"),
+            RepoError::UnauthorizedUser => HttpResponse::InternalServerError().body("Unauthorized User")
         }
     }
 }
@@ -47,7 +51,7 @@ pub struct PollDetails {
     pub creator_id: Uuid,
     pub closed : bool,    
     pub options: Vec<PollOptions>,
-    pub created_at:  String
+    pub created_at:  String,
 }
 
 #[derive(Serialize, Deserialize,Debug)]
@@ -81,9 +85,6 @@ impl<'a> PollRepo<'a> {
     }
 
     async fn insert_poll_options(&self , poll_id: i32 ,options: &Vec<String> ) -> Result<(),RepoError> {
-        println!("inside poll_options function");
-        println!("options are  : {:?}",options );
-        println!("------");
         let mut query = String::from("INSERT INTO poll_options (poll_id, option_text) VALUES ");
     
     let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
@@ -101,7 +102,7 @@ impl<'a> PollRepo<'a> {
             println!("error : {:?}", e);
             RepoError::DatabaseQueryError
         })?;
-        println!("inserted!!!");
+       
         Ok(())
     }
 
@@ -139,6 +140,101 @@ impl<'a> PollRepo<'a> {
         Ok(polls)
     }
 
+    pub async fn get_polls_filtered(
+        &self,
+        creator_id: Option<Uuid>, 
+        live: Option<bool>, 
+        closed: Option<bool>
+    )->Result<Vec<Poll>, RepoError> {
+        let mut query = r#"
+            SELECT p.id, p.title, p.creator_id, 
+                po.option_text, 
+                po.votes 
+            FROM polls p
+            LEFT JOIN poll_options po ON p.id = po.poll_id
+        "#.to_string();
+        let mut conditions = Vec::new();
+        if let Some(creator_id) = creator_id {
+            conditions.push(format!("p.creator_id = '{}'", creator_id));
+        }
+        if let Some(live) = live {
+            if live {
+                conditions.push("p.closed = false".to_string());
+            }
+        }
+        if let Some(closed) = closed {
+            if closed {
+                conditions.push("p.closed = true".to_string());
+            }
+        }
+        if !conditions.is_empty() {
+            query.push_str(" WHERE ");
+            query.push_str(&conditions.join(" AND "));
+        }
+        query.push_str(" GROUP BY p.id, p.title, p.creator_id, po.id");
+        println!("query:  {:?}",query);
+        let rows = self.client.query(&query,&[]).await.map_err(|_| RepoError::DatabaseQueryError)?;
+        let mut polls_map: HashMap<i32, Poll> = HashMap::new();
+        for row in rows {
+            let poll_id: i32 = row.get(0);
+            let title: String = row.get(1);
+            let creator_id: Uuid = row.get(2);
+            let option_text: String = row.get(3);
+            let vote_count: i32 = row.get(4);
+
+            let poll = polls_map.entry(poll_id).or_insert(Poll {
+                id: poll_id,
+                title: title.clone(),
+                creator_id: creator_id.clone(),
+                options: Vec::new(),
+            });
+
+            poll.options.push(PollOptions {
+                option_text,
+                votes: vote_count,
+            });
+        }
+        let polls: Vec<Poll> = polls_map.into_iter().map(|(_, poll)| poll).collect();
+        Ok(polls)
+    }
+
+    pub async fn get_polls_by_creator(&self, user_id: Uuid) -> Result<Vec<Poll>, RepoError> {
+        
+        let query = r#"
+            SELECT p.id, p.title, p.creator_id, 
+                po.option_text, 
+                po.votes 
+            FROM polls p
+            LEFT JOIN poll_options po ON p.id = po.poll_id
+            WHERE p.creator_id = $1
+            GROUP BY p.id, p.title, p.creator_id, po.id
+        "#.to_string();
+        let rows = self.client.query(&query, &[&user_id]).await.map_err(|_| RepoError::DatabaseQueryError)?;
+        let mut polls_map: HashMap<i32, Poll> = HashMap::new();
+
+        for row in rows {
+            let poll_id: i32 = row.get(0);
+            let title: String = row.get(1);
+            let creator_id: Uuid = row.get(2);
+            let option_text: String = row.get(3);
+            let vote_count: i32 = row.get(4);
+
+            let poll = polls_map.entry(poll_id).or_insert(Poll {
+                id: poll_id,
+                title: title.clone(),
+                creator_id: creator_id.clone(),
+                options: Vec::new(),
+            });
+
+            poll.options.push(PollOptions {
+                option_text,
+                votes: vote_count,
+            });
+        }
+        let polls: Vec<Poll> = polls_map.into_iter().map(|(_, poll)| poll).collect();
+        Ok(polls)
+    } 
+
     pub async fn get_option_id_by_text_and_poll_id(&self , option_text: String , poll_id: i32) ->Result<Option<i32>, RepoError> {
         println!("inside get option by text and poll id");
         let query = "SELECT id from poll_options where option_text= $1 and poll_id = $2";
@@ -153,6 +249,25 @@ impl<'a> PollRepo<'a> {
         Ok(())
     }
 
+    pub async fn close_poll(&self, poll_id: i32) -> Result<(), RepoError> {
+        let query = "UPDATE polls SET closed = TRUE WHERE id = $1";
+        self.client.execute(query, &[&poll_id]).await.map_err(|_| RepoError::DatabaseQueryError)?;
+        Ok(())
+    }
+
+    pub async fn reset_votes(&self , poll_id: i32) -> Result<(), RepoError> {
+        let query = "UPDATE poll_options SET votes = 0 WHERE poll_id = $1";
+        self.client.execute(query, &[&poll_id]).await.map_err(|_| RepoError::DatabaseQueryError)?;
+        Ok(())
+    }
+
+    pub async fn is_poll_creator(&self,user_id: Uuid,poll_id: i32) -> Result<bool,RepoError> {
+        let query = "SELECT COUNT(*) FROM polls WHERE id = $1 AND creator_id = $2";
+        let result = self.client.query_one(query, &[&poll_id, &user_id]).await.map_err(|_| RepoError::DatabaseQueryError)?;
+        Ok(result.get::<_, i64>(0) > 0)
+    }
+
+
     pub async fn insert_vote_details(&self, user_id: Uuid, poll_id: i32, option_id: i32,voted_at:String) -> Result<(), RepoError> {
         println!("inside insert vote details function");
         let query = "INSERT INTO votes (user_id, poll_id, option_id, voted_at) VALUES ($1, $2, $3, $4)";
@@ -161,7 +276,6 @@ impl<'a> PollRepo<'a> {
     }
 
     pub async fn get_poll_by_id(&self , poll_id: i32) -> Result<Option<PollDetails> ,RepoError>{
-        println!("entered get poll by id function");
         let query = "select * from polls where id = $1";
         let row = self.client.query_opt(query, &[&poll_id]).await.expect("database query failed for get poll by id fn");
         print!("row : {:?}",row);
@@ -172,7 +286,7 @@ impl<'a> PollRepo<'a> {
                 creator_id: row.get("creator_id"),
                 created_at: row.get("created_at"),
                 options: Vec::new(),
-                closed: row.get("closed")
+                closed: row.get("closed"),
             })),
             None => Ok(None),
         }
@@ -193,11 +307,9 @@ impl<'a> PollRepo<'a> {
     }
 
     pub async fn get_vote_count(&self, option_id: i32) -> Result<i32, tokio_postgres::Error> {
-        println!("entered the get vote count function");
         let query = "SELECT votes FROM poll_options WHERE id = $1";
         let row = self.client.query_one(query, &[&option_id]).await?;
         let vote_count: i32 = row.get("votes");
-        println!("exiting the get vote count function");
         Ok(vote_count)
     }
 }

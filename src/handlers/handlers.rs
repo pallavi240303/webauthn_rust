@@ -63,14 +63,12 @@ pub(crate) async fn register_start(
     let user_unique_id = Uuid::new_v4();
     session.remove("reg_state");
 
-    // Start the WebAuthn registration
     let (ccr , reg_state) = webauthn.start_passkey_registration(user_unique_id, &username, &username,None)
     .map_err(|e| {
         debug!("Challenge_register -> {:?}",e);
         Error::Unknown(e)
     })?;
 
-    // Store the registration state in the session
     if let Err(err) = session.insert("reg_state", (username.as_str(), user_unique_id, reg_state)) {
         error!("Failed to save reg_state to session storage!");
         return Err(Error::SessionInsert(err));
